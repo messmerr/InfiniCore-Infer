@@ -7,6 +7,7 @@
 #include "../../tensor.hpp"
 
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -17,6 +18,13 @@ struct DeviceResource {
     infiniDevice_t device;
     int device_id;
     infiniopHandle_t handle;
+    // Parallelism (2D: TP x PP)
+    int tp_rank = 0;
+    int pp_rank = 0;
+    int tp_degree = 1;
+    int pp_degree = 1;
+    uint32_t stage_layer_start = 0; // inclusive
+    uint32_t stage_layer_end = 0;   // exclusive
     // Weights
     std::shared_ptr<Tensor> w_in_embd, w_out_norm, w_out_embd, sin_table,
         cos_table;
@@ -49,6 +57,14 @@ struct InferRequest {
     const uint32_t *topk;
     const float *topp;
     uint32_t *output;
+    // For PP activation handoff (host-side bounce in first version)
+    void **activation_in_host_arr;   // array size = pp_degree-1, index = stage-1
+    void **activation_out_host_arr;  // array size = pp_degree-1, index = stage
+    uint32_t activation_ntok;   // equals ntok
+    // host-side synchronization between PP stages (size = pp_degree - 1)
+    std::mutex **act_mtx_arr;                // index: boundary
+    std::condition_variable **act_cv_arr;    // index: boundary
+    uint8_t *act_ready_arr;                  // index: boundary
 };
 
 struct JiugeModel {
@@ -59,6 +75,18 @@ struct JiugeModel {
     std::vector<InferState> states;
     std::vector<std::thread> threads;
     InferRequest req;
+    // 2D parallelism
+    int tp_degree = 0;
+    int pp_degree = 0;
+    // host activation bounce buffers and sync for PP boundaries
+    std::vector<std::shared_ptr<Storage>> act_buffers; // size = max(pp_degree-1, 0)
+    std::vector<std::unique_ptr<std::mutex>> act_mtx;
+    std::vector<std::unique_ptr<std::condition_variable>> act_cv;
+    std::vector<uint8_t> act_ready;
+    std::vector<void *> act_in_ptrs;
+    std::vector<void *> act_out_ptrs;
+    std::vector<std::mutex *> act_mtx_ptrs;
+    std::vector<std::condition_variable *> act_cv_ptrs;
 
     JiugeModel(const JiugeMeta *, const JiugeWeights *, infiniDevice_t device, std::vector<int> device_ids);
 };

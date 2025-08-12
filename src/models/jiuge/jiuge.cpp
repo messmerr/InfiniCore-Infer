@@ -6,6 +6,7 @@
 #include "infinicore_infer.h"
 
 #include <random>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -22,47 +23,49 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
 
     std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_out,
         w_ffn_norm, w_ffn_gate_up, w_ffn_down;
-    for (size_t layer = 0; layer < meta->nlayer; layer++) {
+    // 2D parallel: stage range stored in rsrc after construction, default [0, nlayer)
+    uint32_t layer_start = rsrc->stage_layer_start;
+    uint32_t layer_end = rsrc->stage_layer_end == 0 ? meta->nlayer : rsrc->stage_layer_end;
+    for (size_t layer = layer_start; layer < layer_end; layer++) {
         w_attn_norm.push_back(
             getAttnNorm(meta, weights, layer));
         w_attn_qkv.push_back(
-            getAttnQKV(meta, weights, layer, idev, ndev));
+            getAttnQKV(meta, weights, layer, rsrc->tp_rank, rsrc->tp_degree));
         if (weights->attn_qkv_b != nullptr) {
             b_attn_qkv.push_back(
-                getAttnQKVBias(meta, weights, layer, idev, ndev));
+                getAttnQKVBias(meta, weights, layer, rsrc->tp_rank, rsrc->tp_degree));
         }
         w_attn_out.push_back(
-            getAttnO(meta, weights, layer, idev, ndev));
+            getAttnO(meta, weights, layer, rsrc->tp_rank, rsrc->tp_degree));
         w_ffn_norm.push_back(
             getFFNNorm(meta, weights, layer));
         w_ffn_gate_up.push_back(
-            getFFNGateUp(meta, weights, layer, idev, ndev));
+            getFFNGateUp(meta, weights, layer, rsrc->tp_rank, rsrc->tp_degree));
         w_ffn_down.push_back(
-            getFFNDown(meta, weights, layer, idev, ndev));
+            getFFNDown(meta, weights, layer, rsrc->tp_rank, rsrc->tp_degree));
     }
 
     auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
 
-    *rsrc = DeviceResource{
-        device,
-        dev_id,
-        handle,
-        getInEmbd(meta, weights),
-        getOutNorm(meta, weights),
-        getOutEmbd(meta, weights),
-        getSinTable(meta),
-        getCosTable(meta),
-        w_attn_norm,
-        w_attn_qkv,
-        b_attn_qkv,
-        w_attn_out,
-        w_ffn_norm,
-        w_ffn_gate_up,
-        w_ffn_down,
-        stream,
-        comm,
-        memory_pool,
-    };
+    // Preserve existing rsrc fields while updating
+    rsrc->device = device;
+    rsrc->device_id = dev_id;
+    rsrc->handle = handle;
+    rsrc->w_in_embd = getInEmbd(meta, weights);
+    rsrc->w_out_norm = getOutNorm(meta, weights);
+    rsrc->w_out_embd = getOutEmbd(meta, weights);
+    rsrc->sin_table = getSinTable(meta);
+    rsrc->cos_table = getCosTable(meta);
+    rsrc->w_attn_norm = w_attn_norm;
+    rsrc->w_attn_qkv = w_attn_qkv;
+    rsrc->b_attn_qkv = b_attn_qkv;
+    rsrc->w_attn_out = w_attn_out;
+    rsrc->w_ffn_norm = w_ffn_norm;
+    rsrc->w_ffn_gate_up = w_ffn_gate_up;
+    rsrc->w_ffn_down = w_ffn_down;
+    rsrc->stream = stream;
+    rsrc->comm = comm;
+    rsrc->memory_pool = memory_pool;
     RUN_INFINI(infinirtDeviceSynchronize());
 }
 
@@ -116,8 +119,13 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
-                      uint32_t *output) {
-    auto nlayer = meta.nlayer;
+                      uint32_t *output,
+                      const InferRequest &ireq) {
+    // 2D parallel: per-stage layer range
+    auto nlayer_total = meta.nlayer;
+    uint32_t layer_start = rsrc.stage_layer_start;
+    uint32_t layer_end = rsrc.stage_layer_end == 0 ? nlayer_total : rsrc.stage_layer_end;
+    auto nlayer = layer_end - layer_start;
     auto nkvh = meta.nkvh / ndev;
     auto nh = meta.nh / ndev;
     auto ngroup = nh / nkvh;
@@ -158,10 +166,27 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), batch_pos_ids.data(), sizeof(uint32_t) * ntok,
                                        INFINIRT_MEMCPY_H2D, stream));
     }
-    for (uint32_t i = 0; i < ntok; i++) {
-        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                       rsrc.w_in_embd->data(tokens[i] * d),
-                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+    // Stage 0 embeds tokens, other stages receive activation from host bounce buffer
+    if (rsrc.pp_rank == 0) {
+        for (uint32_t i = 0; i < ntok; i++) {
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                           rsrc.w_in_embd->data(tokens[i] * d),
+                                           dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+        }
+    } else {
+        // activation_in_host should point to contiguous [ntok, d]
+        // Copy H2D into logits_in (host bounce buffer from previous stage)
+        size_t bytes = size_t(ntok) * size_t(d) * dsize(dt_logits);
+        void *host_ptr = nullptr;
+        {
+            // wait for activation ready
+            int boundary = rsrc.pp_rank - 1; // boundary index between previous and current stage
+            std::unique_lock<std::mutex> lk(*ireq.act_mtx_arr[boundary]);
+            ireq.act_cv_arr[boundary]->wait(lk, [&]{ return ireq.act_ready_arr[boundary] != 0; });
+            host_ptr = ireq.activation_in_host_arr[boundary];
+            ireq.act_ready_arr[boundary] = 0; // consume
+        }
+        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(), host_ptr, bytes, INFINIRT_MEMCPY_H2D, stream));
     }
 
     // Prepare operators and workspace
@@ -229,8 +254,8 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         // auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
         // kv cache tensors can share the same descriptor
         // [nkvh, dh, total_len]
-        auto full_kv = kv_caches[req]->k[idev][0]->slice(0, 0, total_len)->permute({1, 2, 0});
-        auto cache_kv = kv_caches[req]->k[idev][0]->slice(0, past_len, seq_len);
+        auto full_kv = kv_caches[req]->k[rsrc.tp_rank][0]->slice(0, 0, total_len)->permute({1, 2, 0});
+        auto cache_kv = kv_caches[req]->k[rsrc.tp_rank][0]->slice(0, past_len, seq_len);
 
         RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_kv_rearranges[req],
                                                      cache_kv->desc(), k->desc()));
@@ -321,7 +346,8 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     void *workspace = workspace_storage->memory();
 
     // Compute
-    for (uint32_t layer = 0; layer < nlayer; layer++) {
+    for (uint32_t local_layer = 0; local_layer < nlayer; local_layer++) {
+        uint32_t layer = layer_start + local_layer;
         // 1. Attention
         // rms norm
         RUN_INFINI(infiniopRMSNorm(
@@ -365,17 +391,17 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             // concat
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
-                kv_caches[req]->k[idev][layer]->data(past_len * nkvh * dh),
+                kv_caches[req]->k[rsrc.tp_rank][layer]->data(past_len * nkvh * dh),
                 k->data(), stream));
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
-                kv_caches[req]->v[idev][layer]->data(past_len * nkvh * dh),
+            kv_caches[req]->v[rsrc.tp_rank][layer]->data(past_len * nkvh * dh),
                 v->data(), stream));
             // qk
             RUN_INFINI(infiniopRearrange(desc_q_rearranges[req], rearrange_q_buf->data(), q->data(), stream));
             RUN_INFINI(infiniopGemm(
                 desc_qk_gemms[req], workspace, workspace_size,
-                qk_buf->data(), rearrange_q_buf->data(), kv_caches[req]->k[idev][layer]->data(), 1. / sqrt(dh), 0.0, stream));
+                qk_buf->data(), rearrange_q_buf->data(), kv_caches[req]->k[rsrc.tp_rank][layer]->data(), 1. / sqrt(dh), 0.0, stream));
             // softmax
             RUN_INFINI(infiniopCausalSoftmax(
                 desc_qk_softmaxs[req], workspace, workspace_size,
@@ -383,7 +409,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             // attn val
             RUN_INFINI(infiniopGemm(
                 desc_attn_v_gemms[req], workspace, workspace_size,
-                attn_val_buf->data(), qk_buf->data(), kv_caches[req]->v[idev][layer]->data(), 1.0, 0.0, stream));
+                attn_val_buf->data(), qk_buf->data(), kv_caches[req]->v[rsrc.tp_rank][layer]->data(), 1.0, 0.0, stream));
             // rearrange attn val
             RUN_INFINI(infiniopRearrange(
                 desc_attn_v_rearranges[req],
@@ -431,7 +457,21 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
     }
-    // Sample and Output
+    // Stage handoff or final sample
+    if (rsrc.pp_rank + 1 < rsrc.pp_degree) {
+        // Copy activation to host bounce buffer [ntok, d]; signal next stage
+        size_t bytes = size_t(ntok) * size_t(d) * dsize(dt_logits);
+        RUN_INFINI(infinirtStreamSynchronize(stream));
+        int boundary = rsrc.pp_rank; // boundary index between current and next stage
+        RUN_INFINI(infinirtMemcpy(ireq.activation_out_host_arr[boundary], logits_in->data(), bytes, INFINIRT_MEMCPY_D2H));
+        {
+            std::lock_guard<std::mutex> lk(*ireq.act_mtx_arr[boundary]);
+            ireq.act_ready_arr[boundary] = 1;
+        }
+        ireq.act_cv_arr[boundary]->notify_one();
+        return;
+    }
+    // Final stage: Sample and Output
     if (idev == 0) {
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
@@ -515,6 +555,18 @@ inferBatch(struct JiugeModel *model,
     model->req.topk = topk;
     model->req.topp = topp;
 
+    // Resize host bounce buffers per ntok if needed
+    if (model->pp_degree > 1) {
+        size_t need_bytes = size_t(ntok) * size_t(model->meta.d) * dsize(model->meta.dt_logits);
+        for (int s = 0; s < model->pp_degree - 1; ++s) {
+            if (!model->act_buffers[s] || model->act_buffers[s]->size() < need_bytes) {
+                model->act_buffers[s] = Storage::createHost(need_bytes);
+            }
+        }
+        // Wire per-call activation pointers in request
+        model->req.activation_ntok = ntok;
+    }
+
     for (size_t idev = 0; idev < model->dev_ids.size(); idev++) {
         std::unique_lock<std::mutex> lock(model->states[idev].mtx);
         model->states[idev].proceed = true;
@@ -549,7 +601,7 @@ void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceReso
             break;
         }
 
-        inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output);
+        inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output, req);
 
         state.proceed = false;
         lock.unlock();
@@ -569,12 +621,74 @@ JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infi
     threads.resize(ndev);
     RUN_INFINI(infinirtInit());
     auto comms = std::vector<infinicclComm_t>(ndev, nullptr);
-    if (ndev > 1) {
+
+    // 2D parallel topology from env: INFINI_TP, INFINI_PP
+    const char *tp_env = std::getenv("INFINI_TP");
+    const char *pp_env = std::getenv("INFINI_PP");
+    tp_degree = tp_env ? std::max(1, atoi(tp_env)) : ndev;
+    pp_degree = pp_env ? std::max(1, atoi(pp_env)) : 1;
+    if (tp_degree * pp_degree != ndev) {
+        tp_degree = ndev; pp_degree = 1; // fallback
+    }
+    // First-stage implementation: if using PP, force TP=1 unless subgroup communicators are available
+    if (pp_degree > 1) {
+        tp_degree = 1;
+    }
+    // Build communicators only if tp_degree > 1
+    if (tp_degree > 1) {
         RUN_INFINI(infinicclCommInitAll(device, comms.data(), ndev, dev_ids.data()));
+    }
+    // Assign stage range per device (flat mapping: stage = idev / tp)
+    uint32_t layers_per_stage = (meta.nlayer + pp_degree - 1) / pp_degree;
+    for (int i = 0; i < ndev; i++) {
+        int stage = i / tp_degree;
+        int tp_rank = i % tp_degree;
+        dev_resources[i].pp_rank = stage;
+        dev_resources[i].tp_rank = tp_rank;
+        dev_resources[i].pp_degree = pp_degree;
+        dev_resources[i].tp_degree = tp_degree;
+        uint32_t start = std::min<uint32_t>(stage * layers_per_stage, meta.nlayer);
+        uint32_t end = std::min<uint32_t>((stage + 1) * layers_per_stage, meta.nlayer);
+        dev_resources[i].stage_layer_start = start;
+        dev_resources[i].stage_layer_end = end;
+    }
+
+    // Allocate host bounce buffers and sync primitives if pp_degree > 1
+    if (pp_degree > 1) {
+        act_buffers.resize(pp_degree - 1);
+        act_mtx.resize(pp_degree - 1);
+        act_cv.resize(pp_degree - 1);
+        act_ready.resize(pp_degree - 1);
+        std::fill(act_ready.begin(), act_ready.end(), uint8_t(0));
+        size_t bytes = size_t(meta.d) * size_t(1) * dsize(meta.dt_logits); // will resize per-call via ntok
+        for (int s = 0; s < pp_degree - 1; ++s) {
+            act_buffers[s] = Storage::createHost(bytes);
+            act_mtx[s] = std::make_unique<std::mutex>();
+            act_cv[s] = std::make_unique<std::condition_variable>();
+        }
+        // wire pointers into req
+        act_mtx_ptrs.resize(pp_degree - 1);
+        act_cv_ptrs.resize(pp_degree - 1);
+        for (int s = 0; s < pp_degree - 1; ++s) {
+            act_mtx_ptrs[s] = act_mtx[s].get();
+            act_cv_ptrs[s] = act_cv[s].get();
+        }
+        req.act_mtx_arr = act_mtx_ptrs.data();
+        req.act_cv_arr = act_cv_ptrs.data();
+        req.act_ready_arr = act_ready.data();
+        // build activation in/out views
+        act_in_ptrs.resize(pp_degree - 1);
+        act_out_ptrs.resize(pp_degree - 1);
+        for (int b = 0; b < pp_degree - 1; ++b) {
+            act_in_ptrs[b] = act_buffers[b]->memory();
+            act_out_ptrs[b] = act_buffers[b]->memory();
+        }
+        req.activation_in_host_arr = act_in_ptrs.data();
+        req.activation_out_host_arr = act_out_ptrs.data();
     }
 
     for (int i = 0; i < ndev; i++) {
-        threads[i] = std::thread(launchDevice, std::cref(meta), weights, &dev_resources[i], std::ref(states[i]), std::ref(req), device, i, ndev, dev_ids[i], comms[i]);
+        threads[i] = std::thread(launchDevice, std::cref(meta), weights, &dev_resources[i], std::ref(states[i]), std::ref(req), device, i, dev_resources[i].tp_degree, dev_ids[i], tp_degree > 1 ? comms[i] : nullptr);
     }
     for (int i = 0; i < ndev; i++) {
         std::unique_lock<std::mutex> lock(states[i].mtx);
