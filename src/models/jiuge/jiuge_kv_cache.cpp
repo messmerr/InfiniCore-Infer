@@ -12,9 +12,8 @@ __C struct KVCache *createKVCache(const JiugeModel *model) {
         auto kcache = std::vector<std::shared_ptr<Tensor>>();
         auto vcache = std::vector<std::shared_ptr<Tensor>>();
         for (unsigned int layer = 0; layer < model->meta.nlayer; layer++) {
-            // Allocate KV cache from per-device memory pool to reduce fragmentation
-            kcache.push_back(std::move(Tensor::buffer(model->meta.dt_logits, shape, model->dev_resources[idev].memory_pool)));
-            vcache.push_back(std::move(Tensor::buffer(model->meta.dt_logits, shape, model->dev_resources[idev].memory_pool)));
+            kcache.push_back(std::move(Tensor::buffer(model->meta.dt_logits, shape)));
+            vcache.push_back(std::move(Tensor::buffer(model->meta.dt_logits, shape)));
         }
         cache->k.push_back(kcache);
         cache->v.push_back(vcache);

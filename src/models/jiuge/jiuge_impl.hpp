@@ -28,24 +28,6 @@ struct DeviceResource {
     infinicclComm_t comm;
 
     std::shared_ptr<MemoryPool> memory_pool;
-
-    // Reusable base buffers to reduce frequent allocations during inference
-    // They are oversized 1-D buffers; actual tensors are lightweight views via memShare
-    std::shared_ptr<Tensor> base_dt_logits_buf; // float/bf16/fp16 depending on model logits dtype
-    std::shared_ptr<Tensor> base_i64_buf;
-    std::shared_ptr<Tensor> base_u32_buf;
-    size_t cap_dt_logits_elems = 0;
-    size_t cap_i64_elems = 0;
-    size_t cap_u32_elems = 0;
-
-    // Reusable pinned host storages for small H2D/D2H transfers
-    std::shared_ptr<Storage> host_u32_storage;
-    std::shared_ptr<Storage> host_i64_storage;
-    size_t host_u32_elems = 0;
-    size_t host_i64_elems = 0;
-
-    // Additional streams for per-request intra-layer concurrency
-    std::vector<infinirtStream_t> substreams;
 };
 
 struct InferState {
