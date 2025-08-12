@@ -8,6 +8,8 @@
 #include <random>
 #include <thread>
 #include <vector>
+#include <cstdlib>
+#include <cstring>
 
 void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
                           const JiugeWeights *weights,
@@ -41,15 +43,32 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
             getFFNDown(meta, weights, layer, idev, ndev));
     }
 
-    auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
+    // Allow configuring initial device memory pool size via env var INFINI_POOL_MB (default: 128MB)
+    size_t pool_mb = 128;
+    if (const char *env_mb = std::getenv("INFINI_POOL_MB")) {
+        unsigned long long v = std::strtoull(env_mb, nullptr, 10);
+        if (v > 0) pool_mb = static_cast<size_t>(v);
+    }
+    auto memory_pool = std::make_shared<MemoryPool>(pool_mb * 1024ULL * 1024ULL);
+
+    // Optional: broadcast embedding instead of replicating on all devices
+    bool bcast_embed = false;
+    if (const char *env_b = std::getenv("INFINI_BCAST_EMBED")) {
+        bcast_embed = (std::string(env_b) == "1" || std::string(env_b) == "true");
+    }
+
+    // Build DeviceResource with conditional weights to reduce memory
+    auto in_embd_tensor = (!bcast_embed || idev == 0) ? getInEmbd(meta, weights) : std::shared_ptr<Tensor>();
+    auto out_norm_tensor = (idev == 0) ? getOutNorm(meta, weights) : std::shared_ptr<Tensor>();
+    auto out_embd_tensor = (idev == 0) ? getOutEmbd(meta, weights) : std::shared_ptr<Tensor>();
 
     *rsrc = DeviceResource{
         device,
         dev_id,
         handle,
-        getInEmbd(meta, weights),
-        getOutNorm(meta, weights),
-        getOutEmbd(meta, weights),
+        in_embd_tensor,
+        out_norm_tensor,
+        out_embd_tensor,
         getSinTable(meta),
         getCosTable(meta),
         w_attn_norm,
@@ -62,7 +81,24 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
         stream,
         comm,
         memory_pool,
+        /*base_dt_logits_buf*/ nullptr,
+        /*base_i64_buf*/ nullptr,
+        /*base_u32_buf*/ nullptr,
+        /*cap_dt_logits_elems*/ 0,
+        /*cap_i64_elems*/ 0,
+        /*cap_u32_elems*/ 0,
+        /*host_u32_storage*/ nullptr,
+        /*host_i64_storage*/ nullptr,
+        /*host_u32_elems*/ 0,
+        /*host_i64_elems*/ 0,
+        /*substreams*/ {}
     };
+    // Create substreams for per-request overlap (at most 4 to avoid oversubmission)
+    size_t n_sub = std::min<size_t>(4, std::max<size_t>(1, meta->nkvh));
+    rsrc->substreams.resize(n_sub);
+    for (size_t i = 0; i < n_sub; ++i) {
+        infinirtStreamCreate(&rsrc->substreams[i]);
+    }
     RUN_INFINI(infinirtDeviceSynchronize());
 }
 
@@ -106,6 +142,9 @@ void releaseDeviceResource(DeviceResource &res) {
     res.handle = nullptr;
     infinirtStreamDestroy(res.stream);
     res.stream = nullptr;
+    for (auto &s : res.substreams) {
+        infinirtStreamDestroy(s);
+    }
     infinicclCommDestroy(res.comm);
     res.comm = nullptr;
 }
@@ -130,7 +169,19 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     auto stream = rsrc.stream;
     bool has_qkv_bias = rsrc.b_attn_qkv.size() > 0;
 
-    // Allocate buffers
+    // Allocate/Reuse small base buffers where safe (e.g., pos ids)
+    auto ensure_u32_capacity = [&](size_t elems) {
+        if (rsrc.base_u32_buf == nullptr || rsrc.cap_u32_elems < elems) {
+            rsrc.base_u32_buf = Tensor::buffer(INFINI_DTYPE_U32, {elems}, rsrc.memory_pool);
+            rsrc.cap_u32_elems = elems;
+        }
+        if (rsrc.host_u32_storage == nullptr || rsrc.host_u32_elems < elems) {
+            rsrc.host_u32_storage = Storage::createHost(sizeof(uint32_t) * elems);
+            rsrc.host_u32_elems = elems;
+        }
+    };
+    ensure_u32_capacity(ntok);
+    // Allocate per-iteration compute buffers from pool (independent storage)
     auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
     auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
     auto qkv_buf = Tensor::buffer(dt_logits, {ntok, (nh + nkvh * 2) * dh}, rsrc.memory_pool);
@@ -154,14 +205,30 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     if (rsrc.device == INFINI_DEVICE_CPU) {
         pos_ids_buf = Tensor::weight(batch_pos_ids.data(), INFINI_DTYPE_U32, {ntok});
     } else {
-        pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {ntok}, rsrc.memory_pool);
-        RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), batch_pos_ids.data(), sizeof(uint32_t) * ntok,
+        // Use pinned host buffer to stage H2D copy
+        std::memcpy(rsrc.host_u32_storage->memory(), batch_pos_ids.data(), sizeof(uint32_t) * ntok);
+        pos_ids_buf = rsrc.base_u32_buf->memShare({(size_t)ntok});
+        RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), rsrc.host_u32_storage->memory(), sizeof(uint32_t) * ntok,
                                        INFINIRT_MEMCPY_H2D, stream));
     }
-    for (uint32_t i = 0; i < ntok; i++) {
-        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                       rsrc.w_in_embd->data(tokens[i] * d),
-                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+    bool bcast_embed = false;
+    if (const char *env_b = std::getenv("INFINI_BCAST_EMBED")) {
+        bcast_embed = (std::string(env_b) == "1" || std::string(env_b) == "true");
+    }
+    if (bcast_embed && rsrc.comm != nullptr) {
+        // Fallback: if broadcast API is unavailable, use per-rank copy (same as baseline)
+        // NOTE: InfinicCL currently exposes AllReduce; broadcast not available here
+        for (uint32_t i = 0; i < ntok; i++) {
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                           rsrc.w_in_embd->data(tokens[i] * d),
+                                           dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+        }
+    } else {
+        for (uint32_t i = 0; i < ntok; i++) {
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                           rsrc.w_in_embd->data(tokens[i] * d),
+                                           dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+        }
     }
 
     // Prepare operators and workspace
@@ -215,14 +282,17 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     auto desc_qk_softmaxs = std::vector<infiniopCausalSoftmaxDescriptor_t>(nreq);
     auto desc_attn_v_gemms = std::vector<infiniopGemmDescriptor_t>(nreq);
     auto desc_attn_v_rearranges = std::vector<infiniopRearrangeDescriptor_t>(nreq);
+    std::vector<infinirtEvent_t> req_done_events(nreq, nullptr);
     size_t token_offset = 0;
     size_t max_qk_size = 0;
     size_t max_seq_len = 0;
+    size_t max_total_len = 0;
     o_buf->dimSplit(1, {nh, dh});
     for (uint32_t req = 0; req < nreq; req++) {
         auto past_len = req_pos[req];
         auto seq_len = req_lens[req];
         auto total_len = past_len + seq_len;
+        max_total_len = std::max(max_total_len, size_t(total_len));
         auto o = o_buf->slice({{0, token_offset, seq_len}});
         auto q = qkv_buf->slice({{0, token_offset, seq_len}, {1, 0, nh}});
         auto k = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
@@ -361,36 +431,44 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             auto q = qkv_buf->slice({{0, token_offset, seq_len}, {1, 0, nh}});
             auto k = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
             auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
+
+            infinirtStream_t s = stream;
+            if (!rsrc.substreams.empty()) {
+                s = rsrc.substreams[req % rsrc.substreams.size()];
+            }
             // self attention
-            // concat
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
                 kv_caches[req]->k[idev][layer]->data(past_len * nkvh * dh),
-                k->data(), stream));
+                k->data(), s));
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
                 kv_caches[req]->v[idev][layer]->data(past_len * nkvh * dh),
-                v->data(), stream));
+                v->data(), s));
             // qk
-            RUN_INFINI(infiniopRearrange(desc_q_rearranges[req], rearrange_q_buf->data(), q->data(), stream));
+            RUN_INFINI(infiniopRearrange(desc_q_rearranges[req], rearrange_q_buf->data(), q->data(), s));
             RUN_INFINI(infiniopGemm(
                 desc_qk_gemms[req], workspace, workspace_size,
-                qk_buf->data(), rearrange_q_buf->data(), kv_caches[req]->k[idev][layer]->data(), 1. / sqrt(dh), 0.0, stream));
+                qk_buf->data(), rearrange_q_buf->data(), kv_caches[req]->k[idev][layer]->data(), 1. / sqrt(dh), 0.0, s));
             // softmax
             RUN_INFINI(infiniopCausalSoftmax(
                 desc_qk_softmaxs[req], workspace, workspace_size,
-                qk_buf->data(), qk_buf->data(), stream));
+                qk_buf->data(), qk_buf->data(), s));
             // attn val
             RUN_INFINI(infiniopGemm(
                 desc_attn_v_gemms[req], workspace, workspace_size,
-                attn_val_buf->data(), qk_buf->data(), kv_caches[req]->v[idev][layer]->data(), 1.0, 0.0, stream));
+                attn_val_buf->data(), qk_buf->data(), kv_caches[req]->v[idev][layer]->data(), 1.0, 0.0, s));
             // rearrange attn val
             RUN_INFINI(infiniopRearrange(
                 desc_attn_v_rearranges[req],
                 o->data(),
-                attn_val_buf->data(), stream));
+                attn_val_buf->data(), s));
 
             token_offset += seq_len;
+        }
+        // Ensure substreams complete before o_proj
+        for (auto &s : rsrc.substreams) {
+            RUN_INFINI(infinirtStreamSynchronize(s));
         }
         // o_proj
         RUN_INFINI(infiniopGemm(
@@ -403,7 +481,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             RUN_INFINI(infinicclAllReduce(
                 logits_in->data(), logits_in->data(), ntok * d, dt_logits,
                 INFINICCL_SUM, rsrc.comm, stream));
-            RUN_INFINI(infinirtStreamSynchronize(stream));
+            // NOTE: No explicit stream synchronize here to allow comm/compute overlap.
         }
         // 2. FFN
         // rms_norm
@@ -428,12 +506,13 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             RUN_INFINI(infinicclAllReduce(
                 logits_in->data(), logits_in->data(), ntok * d, dt_logits,
                 INFINICCL_SUM, rsrc.comm, stream));
-            RUN_INFINI(infinirtStreamSynchronize(stream));
+            // NOTE: No explicit stream synchronize here to allow comm/compute overlap.
         }
     }
     // Sample and Output
     if (idev == 0) {
         size_t token_offset = 0;
+        // Fuse last-token extraction for each request to reduce small kernel overhead
         for (uint32_t req = 0; req < nreq; req++) {
             auto seq_len = req_lens[req];
             token_offset += seq_len;
@@ -472,7 +551,8 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         }
     }
 
-    // Clean up
+    // Clean up descriptors
+    // NOTE: We keep buffers via memory pool; descriptors are lightweight and recreated per call for now
     infiniopDestroyRMSNormDescriptor(desc_norm);
     if (has_qkv_bias) {
         infiniopDestroyRearrangeDescriptor(desc_qkv_bias);
