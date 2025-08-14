@@ -19,6 +19,9 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
     infiniopCreateHandle(&handle);
     infinirtStream_t stream;
     infinirtStreamCreate(&stream);
+    // create a dedicated comm stream for collectives
+    infinirtStream_t comm_stream;
+    infinirtStreamCreate(&comm_stream);
 
     std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_out,
         w_ffn_norm, w_ffn_gate_up, w_ffn_down;
@@ -60,6 +63,7 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
         w_ffn_gate_up,
         w_ffn_down,
         stream,
+        comm_stream,
         comm,
         memory_pool,
     };
@@ -106,6 +110,11 @@ void releaseDeviceResource(DeviceResource &res) {
     res.handle = nullptr;
     infinirtStreamDestroy(res.stream);
     res.stream = nullptr;
+    // destroy comm stream if exists
+    if (res.comm_stream != nullptr) {
+        infinirtStreamDestroy(res.comm_stream);
+        res.comm_stream = nullptr;
+    }
     infinicclCommDestroy(res.comm);
     res.comm = nullptr;
 }
@@ -400,10 +409,12 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
+            // launch all-reduce on comm_stream to pave the way for future overlap
             RUN_INFINI(infinicclAllReduce(
                 logits_in->data(), logits_in->data(), ntok * d, dt_logits,
-                INFINICCL_SUM, rsrc.comm, stream));
-            RUN_INFINI(infinirtStreamSynchronize(stream));
+                INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
+            // synchronize comm stream before logits_in is consumed by FFN RMSNorm
+            RUN_INFINI(infinirtStreamSynchronize(rsrc.comm_stream));
         }
         // 2. FFN
         // rms_norm
@@ -425,10 +436,12 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
+            // launch all-reduce on comm_stream to pave the way for future overlap
             RUN_INFINI(infinicclAllReduce(
                 logits_in->data(), logits_in->data(), ntok * d, dt_logits,
-                INFINICCL_SUM, rsrc.comm, stream));
-            RUN_INFINI(infinirtStreamSynchronize(stream));
+                INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
+            // synchronize comm stream before next layer consumes logits_in
+            RUN_INFINI(infinirtStreamSynchronize(rsrc.comm_stream));
         }
     }
     // Sample and Output
