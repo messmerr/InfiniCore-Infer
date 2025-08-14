@@ -81,7 +81,7 @@ class LlamaWeightsNaming:
 
 
 class JiugeMetaFromLlama(JiugeMetaCStruct):
-    def __init__(self, config, dtype=torch.float16, max_tokens=None):
+    def __init__(self, config, dtype=torch.float16, max_tokens=None, tp_size: int = 1, enable_sp: bool = False):
         if dtype == torch.float16:
             dt_ = DataType.INFINI_DTYPE_F16
         elif dtype == torch.float32:
@@ -129,6 +129,8 @@ class JiugeMetaFromLlama(JiugeMetaCStruct):
             epsilon=config["rms_norm_eps"],
             theta=(config["rope_theta"] if "rope_theta" in config else 100000.0),
             end_token=2,
+            tp_size=tp_size,
+            enable_sp=1 if enable_sp else 0,
         )
         self.torch_dtype_logits = dtype
 
@@ -392,7 +394,7 @@ class JiugeBatchedTask:
 
 class JiugeForCauslLM:
     def __init__(
-        self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None
+        self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None, enable_sp: bool = False
     ):
         def load_all_safetensors_from_dir(dir_path_: str):
             tensors_ = {}
@@ -422,7 +424,7 @@ class JiugeForCauslLM:
                 .cpu()
                 .half()
             )
-            self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+            self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens, tp_size=ndev, enable_sp=enable_sp)
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_dir_path)
             self.weights = JiugeWeightsImpl(
                 self.meta,
@@ -443,7 +445,7 @@ class JiugeForCauslLM:
                     map_location="cpu",
                 )
             if LlamaWeightsNaming.match(state_dict):
-                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens, tp_size=ndev, enable_sp=enable_sp)
                 self.weights = JiugeWeightsImpl(
                     self.meta,
                     LlamaWeightsNaming(),
@@ -468,7 +470,7 @@ class JiugeForCauslLM:
                     map_location="cpu",
                 )
             if LlamaWeightsNaming.match(state_dict):
-                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens, tp_size=ndev, enable_sp=enable_sp)
                 self.weights = JiugeWeightsImpl(
                     self.meta,
                     LlamaWeightsNaming(),

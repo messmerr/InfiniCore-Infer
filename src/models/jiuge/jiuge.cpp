@@ -279,9 +279,8 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
         token_offset += seq_len;
     }
-    auto qk_buf = Tensor::buffer(dt_logits, {nh, max_qk_size}, rsrc.memory_pool);
-    auto rearrange_q_buf = Tensor::buffer(dt_logits, {nkvh, ngroup * max_seq_len, dh}, rsrc.memory_pool);
-    auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, dh}, rsrc.memory_pool);
+    // Per-request temporary buffers will be allocated to enable multi-stream attention overlap.
+    // auto qk_buf / rearrange_q_buf / attn_val_buf are now per-request.
 
     // MLP descriptors
     infiniopGemmDescriptor_t desc_ffn_gate_up, desc_ffn_down;
@@ -330,6 +329,10 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     void *workspace = workspace_storage->memory();
 
     // Compute
+    // NOTE: 当前使用comm_stream同步保证正确性。若目标环境提供事件API，可用事件替代全流同步：
+    // infinirtEvent_t ev; infinirtEventCreate(&ev); infinirtEventRecord(ev, rsrc.comm_stream);
+    // infinirtStreamWaitEvent(stream, ev);
+    // 并在退出前Destroy事件；以实现更细粒度的重叠。
     for (uint32_t layer = 0; layer < nlayer; layer++) {
         // 1. Attention
         // rms norm
@@ -362,44 +365,62 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             rsrc.cos_table->data(),
             stream));
 
+        // Multi-stream attention inner to overlap different requests
+        std::vector<infinirtStream_t> attn_streams(nreq, nullptr);
+        for (uint32_t req = 0; req < nreq; req++) {
+            infinirtStreamCreate(&attn_streams[req]);
+        }
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
+            auto s = attn_streams[req];
             auto past_len = req_pos[req];
             auto seq_len = req_lens[req];
             auto o = o_buf->slice({{0, token_offset, seq_len}});
             auto q = qkv_buf->slice({{0, token_offset, seq_len}, {1, 0, nh}});
             auto k = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
             auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
-            // self attention
-            // concat
+
+            // Allocate per-request temporaries
+            auto qk_elems = size_t(seq_len) * size_t(past_len + seq_len);
+            auto qk_buf_r = Tensor::buffer(dt_logits, {nh, qk_elems}, rsrc.memory_pool);
+            auto rearrange_q_buf_r = Tensor::buffer(dt_logits, {nkvh, ngroup * seq_len, dh}, rsrc.memory_pool);
+            auto attn_val_buf_r = Tensor::buffer(dt_logits, {nh, seq_len, dh}, rsrc.memory_pool);
+
+            // concat new k/v into KV cache tail
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
                 kv_caches[req]->k[idev][layer]->data(past_len * nkvh * dh),
-                k->data(), stream));
+                k->data(), s));
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
                 kv_caches[req]->v[idev][layer]->data(past_len * nkvh * dh),
-                v->data(), stream));
+                v->data(), s));
             // qk
-            RUN_INFINI(infiniopRearrange(desc_q_rearranges[req], rearrange_q_buf->data(), q->data(), stream));
+            RUN_INFINI(infiniopRearrange(desc_q_rearranges[req], rearrange_q_buf_r->data(), q->data(), s));
             RUN_INFINI(infiniopGemm(
                 desc_qk_gemms[req], workspace, workspace_size,
-                qk_buf->data(), rearrange_q_buf->data(), kv_caches[req]->k[idev][layer]->data(), 1. / sqrt(dh), 0.0, stream));
+                qk_buf_r->data(), rearrange_q_buf_r->data(), kv_caches[req]->k[idev][layer]->data(), 1. / sqrt(dh), 0.0, s));
             // softmax
             RUN_INFINI(infiniopCausalSoftmax(
                 desc_qk_softmaxs[req], workspace, workspace_size,
-                qk_buf->data(), qk_buf->data(), stream));
+                qk_buf_r->data(), qk_buf_r->data(), s));
             // attn val
             RUN_INFINI(infiniopGemm(
                 desc_attn_v_gemms[req], workspace, workspace_size,
-                attn_val_buf->data(), qk_buf->data(), kv_caches[req]->v[idev][layer]->data(), 1.0, 0.0, stream));
-            // rearrange attn val
+                attn_val_buf_r->data(), qk_buf_r->data(), kv_caches[req]->v[idev][layer]->data(), 1.0, 0.0, s));
+            // rearrange attn val into o
             RUN_INFINI(infiniopRearrange(
                 desc_attn_v_rearranges[req],
                 o->data(),
-                attn_val_buf->data(), stream));
+                attn_val_buf_r->data(), s));
 
             token_offset += seq_len;
+        }
+        // synchronize all attention substreams before o_proj
+        for (uint32_t req = 0; req < nreq; req++) {
+            RUN_INFINI(infinirtStreamSynchronize(attn_streams[req]));
+            infinirtStreamDestroy(attn_streams[req]);
+            attn_streams[req] = nullptr;
         }
         // o_proj
         RUN_INFINI(infiniopGemm(
@@ -407,13 +428,31 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             logits_in->data(), o_buf->data(),
             rsrc.w_attn_out[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream)); // only rank 0 adds residual
 
-        // All_reduce if distributed
+        // Aggregate partial results if distributed
         if (rsrc.comm != nullptr) {
-            // launch all-reduce on comm_stream to pave the way for future overlap
-            RUN_INFINI(infinicclAllReduce(
-                logits_in->data(), logits_in->data(), ntok * d, dt_logits,
-                INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
-            // synchronize comm stream before logits_in is consumed by FFN RMSNorm
+            size_t tp_size = meta.tp_size == 0 ? ndev : meta.tp_size;
+            if (tp_size == 0) tp_size = ndev;
+#if defined(INFINICCL_HAS_RS_AG)
+            if (meta.enable_sp && (d % tp_size == 0)) {
+                // reduce-scatter to shard logits across TP ranks
+                auto d_local = d / tp_size;
+                auto rs_buf = Tensor::buffer(dt_logits, {ntok, d_local}, rsrc.memory_pool);
+                RUN_INFINI(infinicclReduceScatter(
+                    logits_in->data(), rs_buf->data(), ntok * d_local, dt_logits,
+                    INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
+                // for compatibility, all-gather back to full logits_in before next op
+                RUN_INFINI(infinicclAllGather(
+                    rs_buf->data(), logits_in->data(), ntok * d_local, dt_logits,
+                    rsrc.comm, rsrc.comm_stream));
+            } else
+#endif
+            {
+                // fallback: all-reduce on comm_stream
+                RUN_INFINI(infinicclAllReduce(
+                    logits_in->data(), logits_in->data(), ntok * d, dt_logits,
+                    INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
+            }
+            // Ensure aggregated logits are ready before next consumer
             RUN_INFINI(infinirtStreamSynchronize(rsrc.comm_stream));
         }
         // 2. FFN
@@ -434,13 +473,31 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             logits_in->data(), gate_buf->data(),
             rsrc.w_ffn_down[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream)); // only rank 0 adds residual
 
-        // All_reduce if distributed
+        // Aggregate partial results if distributed
         if (rsrc.comm != nullptr) {
-            // launch all-reduce on comm_stream to pave the way for future overlap
-            RUN_INFINI(infinicclAllReduce(
-                logits_in->data(), logits_in->data(), ntok * d, dt_logits,
-                INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
-            // synchronize comm stream before next layer consumes logits_in
+            size_t tp_size = meta.tp_size == 0 ? ndev : meta.tp_size;
+            if (tp_size == 0) tp_size = ndev;
+#if defined(INFINICCL_HAS_RS_AG)
+            if (meta.enable_sp && (d % tp_size == 0)) {
+                // reduce-scatter to shard logits across TP ranks
+                auto d_local = d / tp_size;
+                auto rs_buf = Tensor::buffer(dt_logits, {ntok, d_local}, rsrc.memory_pool);
+                RUN_INFINI(infinicclReduceScatter(
+                    logits_in->data(), rs_buf->data(), ntok * d_local, dt_logits,
+                    INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
+                // for compatibility, all-gather back to full logits_in before next layer
+                RUN_INFINI(infinicclAllGather(
+                    rs_buf->data(), logits_in->data(), ntok * d_local, dt_logits,
+                    rsrc.comm, rsrc.comm_stream));
+            } else
+#endif
+            {
+                // fallback: all-reduce on comm_stream
+                RUN_INFINI(infinicclAllReduce(
+                    logits_in->data(), logits_in->data(), ntok * d, dt_logits,
+                    INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
+            }
+            // Ensure aggregated logits are ready before next layer
             RUN_INFINI(infinirtStreamSynchronize(rsrc.comm_stream));
         }
     }

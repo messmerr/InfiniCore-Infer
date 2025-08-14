@@ -50,6 +50,9 @@ class JiugeMetaCStruct(ctypes.Structure):
         ("epsilon", c_float),
         ("theta", c_float),
         ("end_token", c_uint),
+        # extensions for parallelism
+        ("tp_size", c_size_t),
+        ("enable_sp", c_int),
     ]
 
 

@@ -15,6 +15,11 @@ typedef struct
     size_t nlayer, d, nh, nkvh, dh, di, dctx, dvoc;
     float epsilon, theta;
     uint32_t end_token;
+    // ===== Parallelism flags (extension) =====
+    // tp_size: tensor-parallel group size (default: ndev)
+    size_t tp_size;
+    // enable_sp: sequence-parallel activation sharding within TP group (0/1)
+    int enable_sp;
 } JiugeMeta;
 
 typedef struct
