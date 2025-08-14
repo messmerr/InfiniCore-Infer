@@ -38,21 +38,27 @@ inline float f16_to_f32(uint16_t h) {
     int32_t exponent = (h >> 10) & 0x1F; // Extract the exponent
     uint32_t mantissa = h & 0x3FF;       // Extract the mantissa (fraction part)
 
+    auto ret_from_bits = [](uint32_t bits) -> float {
+        float out;
+        std::memcpy(&out, &bits, sizeof(out));
+        return out;
+    };
+
     if (exponent == 31) { // Special case for Inf and NaN
         if (mantissa != 0) {
             // NaN: Set float32 NaN
             uint32_t f32 = sign | 0x7F800000 | (mantissa << 13);
-            return *(float *)&f32;
+            return ret_from_bits(f32);
         } else {
             // Infinity
             uint32_t f32 = sign | 0x7F800000;
-            return *(float *)&f32;
+            return ret_from_bits(f32);
         }
     } else if (exponent == 0) { // Subnormal float16 or zero
         if (mantissa == 0) {
             // Zero (positive or negative)
             uint32_t f32 = sign; // Just return signed zero
-            return *(float *)&f32;
+            return ret_from_bits(f32);
         } else {
             // Subnormal: Convert to normalized float32
             exponent = -14;                   // Set exponent for subnormal numbers
@@ -62,12 +68,12 @@ inline float f16_to_f32(uint16_t h) {
             }
             mantissa &= 0x3FF; // Clear the leading 1 bit
             uint32_t f32 = sign | ((exponent + 127) << 23) | (mantissa << 13);
-            return *(float *)&f32;
+            return ret_from_bits(f32);
         }
     } else {
         // Normalized float16
         uint32_t f32 = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
-        return *(float *)&f32;
+        return ret_from_bits(f32);
     }
 }
 
