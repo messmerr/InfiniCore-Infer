@@ -372,6 +372,13 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         for (uint32_t i = 0; i < max_attn_streams; i++) {
             infinirtStreamCreate(&attn_streams[i]);
         }
+        // Allocate one workspace per attention stream to avoid cross-stream races
+        std::vector<std::shared_ptr<Storage>> attn_ws_storages(max_attn_streams);
+        std::vector<void*> attn_workspaces(max_attn_streams, nullptr);
+        for (uint32_t i = 0; i < max_attn_streams; i++) {
+            attn_ws_storages[i] = Storage::createFromPool(workspace_size, rsrc.memory_pool);
+            attn_workspaces[i] = attn_ws_storages[i]->memory();
+        }
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
             auto s = attn_streams[req % max_attn_streams];
@@ -399,16 +406,17 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                 v->data(), s));
             // qk
             RUN_INFINI(infiniopRearrange(desc_q_rearranges[req], rearrange_q_buf_r->data(), q->data(), s));
+            auto ws = attn_workspaces[req % max_attn_streams];
             RUN_INFINI(infiniopGemm(
-                desc_qk_gemms[req], workspace, workspace_size,
+                desc_qk_gemms[req], ws, workspace_size,
                 qk_buf_r->data(), rearrange_q_buf_r->data(), kv_caches[req]->k[idev][layer]->data(), 1. / sqrt(dh), 0.0, s));
             // softmax
             RUN_INFINI(infiniopCausalSoftmax(
-                desc_qk_softmaxs[req], workspace, workspace_size,
+                desc_qk_softmaxs[req], ws, workspace_size,
                 qk_buf_r->data(), qk_buf_r->data(), s));
             // attn val
             RUN_INFINI(infiniopGemm(
-                desc_attn_v_gemms[req], workspace, workspace_size,
+                desc_attn_v_gemms[req], ws, workspace_size,
                 attn_val_buf_r->data(), qk_buf_r->data(), kv_caches[req]->v[idev][layer]->data(), 1.0, 0.0, s));
             // rearrange attn val into o
             RUN_INFINI(infiniopRearrange(
