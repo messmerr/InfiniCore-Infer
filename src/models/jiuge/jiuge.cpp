@@ -366,13 +366,15 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             stream));
 
         // Multi-stream attention inner to overlap different requests
-        std::vector<infinirtStream_t> attn_streams(nreq, nullptr);
-        for (uint32_t req = 0; req < nreq; req++) {
-            infinirtStreamCreate(&attn_streams[req]);
+        // Use a small stream pool to avoid excessive stream create/destroy overhead
+        uint32_t max_attn_streams = std::min<uint32_t>(nreq, 8);
+        std::vector<infinirtStream_t> attn_streams(max_attn_streams, nullptr);
+        for (uint32_t i = 0; i < max_attn_streams; i++) {
+            infinirtStreamCreate(&attn_streams[i]);
         }
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
-            auto s = attn_streams[req];
+            auto s = attn_streams[req % max_attn_streams];
             auto past_len = req_pos[req];
             auto seq_len = req_lens[req];
             auto o = o_buf->slice({{0, token_offset, seq_len}});
@@ -417,10 +419,10 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             token_offset += seq_len;
         }
         // synchronize all attention substreams before o_proj
-        for (uint32_t req = 0; req < nreq; req++) {
-            RUN_INFINI(infinirtStreamSynchronize(attn_streams[req]));
-            infinirtStreamDestroy(attn_streams[req]);
-            attn_streams[req] = nullptr;
+        for (uint32_t i = 0; i < max_attn_streams; i++) {
+            RUN_INFINI(infinirtStreamSynchronize(attn_streams[i]));
+            infinirtStreamDestroy(attn_streams[i]);
+            attn_streams[i] = nullptr;
         }
         // o_proj
         RUN_INFINI(infiniopGemm(
@@ -453,7 +455,15 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                     INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
             }
             // Ensure aggregated logits are ready before next consumer
+#if defined(INFINIRT_HAS_EVENT)
+            infinirtEvent_t ev_comm_done;
+            RUN_INFINI(infinirtEventCreate(&ev_comm_done));
+            RUN_INFINI(infinirtEventRecord(ev_comm_done, rsrc.comm_stream));
+            RUN_INFINI(infinirtStreamWaitEvent(stream, ev_comm_done));
+            RUN_INFINI(infinirtEventDestroy(ev_comm_done));
+#else
             RUN_INFINI(infinirtStreamSynchronize(rsrc.comm_stream));
+#endif
         }
         // 2. FFN
         // rms_norm
@@ -498,7 +508,15 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                     INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
             }
             // Ensure aggregated logits are ready before next layer
+#if defined(INFINIRT_HAS_EVENT)
+            infinirtEvent_t ev_comm_done;
+            RUN_INFINI(infinirtEventCreate(&ev_comm_done));
+            RUN_INFINI(infinirtEventRecord(ev_comm_done, rsrc.comm_stream));
+            RUN_INFINI(infinirtStreamWaitEvent(stream, ev_comm_done));
+            RUN_INFINI(infinirtEventDestroy(ev_comm_done));
+#else
             RUN_INFINI(infinirtStreamSynchronize(rsrc.comm_stream));
+#endif
         }
     }
     // Sample and Output
