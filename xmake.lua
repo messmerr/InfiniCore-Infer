@@ -11,6 +11,15 @@ target("infinicore_infer")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    set_optimize("fastest")
+
+    -- Optional feature toggles via environment
+    if os.getenv("INFINICCL_HAS_RS_AG") == "1" then
+        add_defines("INFINICCL_HAS_RS_AG")
+    end
+    if os.getenv("INFINIRT_HAS_EVENT") == "1" then
+        add_defines("INFINIRT_HAS_EVENT")
+    end
 
     add_files("src/models/*/*.cpp")
     add_files("src/tensor/*.cpp")

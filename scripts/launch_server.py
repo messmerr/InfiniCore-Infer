@@ -58,6 +58,11 @@ def parse_args():
         default=None,
         help="Max token sequence length that model will handle (follows model config if not provided)",
     )
+    parser.add_argument(
+        "--enable-sp",
+        action="store_true",
+        help="Enable sequence-parallel compatible path (requires RS/AG build to take effect)",
+    )
     return parser.parse_args()
 
 args = parse_args()
@@ -65,6 +70,7 @@ device_type = DEVICE_TYPE_MAP[args.dev]
 model_path = args.model_path
 ndev = args.ndev
 max_tokens = args.max_tokens
+enable_sp = args.enable_sp
 
 MAX_BATCH = args.max_batch
 print(
@@ -109,7 +115,7 @@ class AsyncInferTask(InferTask):
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    app.state.model = JiugeForCauslLM(model_path, device_type, ndev, max_tokens=max_tokens)
+    app.state.model = JiugeForCauslLM(model_path, device_type, ndev, max_tokens=max_tokens, enable_sp=enable_sp)
     app.state.kv_cache_pool = KVCachePool(app.state.model, MAX_BATCH)
     app.state.request_queue = janus.Queue()
     worker_thread = threading.Thread(target=worker_loop, args=(app,), daemon=True)
