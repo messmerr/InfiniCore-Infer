@@ -416,6 +416,15 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         if (rsrc.comm != nullptr) {
             size_t tp_size = meta.tp_size == 0 ? ndev : meta.tp_size;
             if (tp_size == 0) tp_size = ndev;
+            // Make comm_stream wait for compute stream to finish producing logits_in
+#if defined(INFINIRT_HAS_EVENT)
+            infinirtEvent_t ev_ready;
+            RUN_INFINI(infinirtEventCreate(&ev_ready));
+            RUN_INFINI(infinirtEventRecord(ev_ready, stream));
+            RUN_INFINI(infinirtStreamWaitEvent(rsrc.comm_stream, ev_ready));
+#else
+            RUN_INFINI(infinirtStreamSynchronize(stream));
+#endif
 #if defined(INFINICCL_HAS_RS_AG)
             if (meta.enable_sp && (d % tp_size == 0)) {
                 // reduce-scatter to shard logits across TP ranks
@@ -436,13 +445,14 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                     logits_in->data(), logits_in->data(), ntok * d, dt_logits,
                     INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
             }
-            // Ensure aggregated logits are ready before next consumer
+            // Ensure aggregated logits are ready before next consumer on compute stream
 #if defined(INFINIRT_HAS_EVENT)
             infinirtEvent_t ev_comm_done;
             RUN_INFINI(infinirtEventCreate(&ev_comm_done));
             RUN_INFINI(infinirtEventRecord(ev_comm_done, rsrc.comm_stream));
             RUN_INFINI(infinirtStreamWaitEvent(stream, ev_comm_done));
             RUN_INFINI(infinirtEventDestroy(ev_comm_done));
+            RUN_INFINI(infinirtEventDestroy(ev_ready));
 #else
             RUN_INFINI(infinirtStreamSynchronize(rsrc.comm_stream));
 #endif
@@ -469,6 +479,15 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         if (rsrc.comm != nullptr) {
             size_t tp_size = meta.tp_size == 0 ? ndev : meta.tp_size;
             if (tp_size == 0) tp_size = ndev;
+            // Make comm_stream wait for compute stream to finish producing logits_in
+#if defined(INFINIRT_HAS_EVENT)
+            infinirtEvent_t ev_ready2;
+            RUN_INFINI(infinirtEventCreate(&ev_ready2));
+            RUN_INFINI(infinirtEventRecord(ev_ready2, stream));
+            RUN_INFINI(infinirtStreamWaitEvent(rsrc.comm_stream, ev_ready2));
+#else
+            RUN_INFINI(infinirtStreamSynchronize(stream));
+#endif
 #if defined(INFINICCL_HAS_RS_AG)
             if (meta.enable_sp && (d % tp_size == 0)) {
                 // reduce-scatter to shard logits across TP ranks
@@ -489,13 +508,14 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                     logits_in->data(), logits_in->data(), ntok * d, dt_logits,
                     INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
             }
-            // Ensure aggregated logits are ready before next layer
+            // Ensure aggregated logits are ready before next layer on compute stream
 #if defined(INFINIRT_HAS_EVENT)
             infinirtEvent_t ev_comm_done;
             RUN_INFINI(infinirtEventCreate(&ev_comm_done));
             RUN_INFINI(infinirtEventRecord(ev_comm_done, rsrc.comm_stream));
             RUN_INFINI(infinirtStreamWaitEvent(stream, ev_comm_done));
             RUN_INFINI(infinirtEventDestroy(ev_comm_done));
+            RUN_INFINI(infinirtEventDestroy(ev_ready2));
 #else
             RUN_INFINI(infinirtStreamSynchronize(rsrc.comm_stream));
 #endif
