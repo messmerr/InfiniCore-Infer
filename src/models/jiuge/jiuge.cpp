@@ -279,8 +279,10 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
         token_offset += seq_len;
     }
-    // Per-request temporary buffers will be allocated to enable multi-stream attention overlap.
-    // auto qk_buf / rearrange_q_buf / attn_val_buf are now per-request.
+    // Shared temporary buffers sized to max for sequential attention inner loop
+    auto qk_buf = Tensor::buffer(dt_logits, {nh, max_qk_size}, rsrc.memory_pool);
+    auto rearrange_q_buf = Tensor::buffer(dt_logits, {nkvh, ngroup * max_seq_len, dh}, rsrc.memory_pool);
+    auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, dh}, rsrc.memory_pool);
 
     // MLP descriptors
     infiniopGemmDescriptor_t desc_ffn_gate_up, desc_ffn_down;
@@ -365,72 +367,44 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             rsrc.cos_table->data(),
             stream));
 
-        // Multi-stream attention inner to overlap different requests
-        // Use a small stream pool to avoid excessive stream create/destroy overhead
-        uint32_t max_attn_streams = std::min<uint32_t>(nreq, 8);
-        std::vector<infinirtStream_t> attn_streams(max_attn_streams, nullptr);
-        for (uint32_t i = 0; i < max_attn_streams; i++) {
-            infinirtStreamCreate(&attn_streams[i]);
-        }
-        // Allocate one workspace per attention stream to avoid cross-stream races
-        std::vector<std::shared_ptr<Storage>> attn_ws_storages(max_attn_streams);
-        std::vector<void*> attn_workspaces(max_attn_streams, nullptr);
-        for (uint32_t i = 0; i < max_attn_streams; i++) {
-            attn_ws_storages[i] = Storage::createFromPool(workspace_size, rsrc.memory_pool);
-            attn_workspaces[i] = attn_ws_storages[i]->memory();
-        }
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
-            auto s = attn_streams[req % max_attn_streams];
             auto past_len = req_pos[req];
             auto seq_len = req_lens[req];
             auto o = o_buf->slice({{0, token_offset, seq_len}});
             auto q = qkv_buf->slice({{0, token_offset, seq_len}, {1, 0, nh}});
             auto k = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
             auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
-
-            // Allocate per-request temporaries
-            auto qk_elems = size_t(seq_len) * size_t(past_len + seq_len);
-            auto qk_buf_r = Tensor::buffer(dt_logits, {nh, qk_elems}, rsrc.memory_pool);
-            auto rearrange_q_buf_r = Tensor::buffer(dt_logits, {nkvh, ngroup * seq_len, dh}, rsrc.memory_pool);
-            auto attn_val_buf_r = Tensor::buffer(dt_logits, {nh, seq_len, dh}, rsrc.memory_pool);
-
-            // concat new k/v into KV cache tail
+            // self attention
+            // concat
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
                 kv_caches[req]->k[idev][layer]->data(past_len * nkvh * dh),
-                k->data(), s));
+                k->data(), stream));
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
                 kv_caches[req]->v[idev][layer]->data(past_len * nkvh * dh),
-                v->data(), s));
+                v->data(), stream));
             // qk
-            RUN_INFINI(infiniopRearrange(desc_q_rearranges[req], rearrange_q_buf_r->data(), q->data(), s));
-            auto ws = attn_workspaces[req % max_attn_streams];
+            RUN_INFINI(infiniopRearrange(desc_q_rearranges[req], rearrange_q_buf->data(), q->data(), stream));
             RUN_INFINI(infiniopGemm(
-                desc_qk_gemms[req], ws, workspace_size,
-                qk_buf_r->data(), rearrange_q_buf_r->data(), kv_caches[req]->k[idev][layer]->data(), 1. / sqrt(dh), 0.0, s));
+                desc_qk_gemms[req], workspace, workspace_size,
+                qk_buf->data(), rearrange_q_buf->data(), kv_caches[req]->k[idev][layer]->data(), 1. / sqrt(dh), 0.0, stream));
             // softmax
             RUN_INFINI(infiniopCausalSoftmax(
-                desc_qk_softmaxs[req], ws, workspace_size,
-                qk_buf_r->data(), qk_buf_r->data(), s));
+                desc_qk_softmaxs[req], workspace, workspace_size,
+                qk_buf->data(), qk_buf->data(), stream));
             // attn val
             RUN_INFINI(infiniopGemm(
-                desc_attn_v_gemms[req], ws, workspace_size,
-                attn_val_buf_r->data(), qk_buf_r->data(), kv_caches[req]->v[idev][layer]->data(), 1.0, 0.0, s));
-            // rearrange attn val into o
+                desc_attn_v_gemms[req], workspace, workspace_size,
+                attn_val_buf->data(), qk_buf->data(), kv_caches[req]->v[idev][layer]->data(), 1.0, 0.0, stream));
+            // rearrange attn val
             RUN_INFINI(infiniopRearrange(
                 desc_attn_v_rearranges[req],
                 o->data(),
-                attn_val_buf_r->data(), s));
+                attn_val_buf->data(), stream));
 
             token_offset += seq_len;
-        }
-        // synchronize all attention substreams before o_proj
-        for (uint32_t i = 0; i < max_attn_streams; i++) {
-            RUN_INFINI(infinirtStreamSynchronize(attn_streams[i]));
-            infinirtStreamDestroy(attn_streams[i]);
-            attn_streams[i] = nullptr;
         }
         // o_proj
         RUN_INFINI(infiniopGemm(
