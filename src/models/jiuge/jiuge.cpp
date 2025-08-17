@@ -19,6 +19,8 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
     infiniopCreateHandle(&handle);
     infinirtStream_t stream;
     infinirtStreamCreate(&stream);
+    infinirtStream_t comm_stream;
+    infinirtStreamCreate(&comm_stream);
 
     std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_out,
         w_ffn_norm, w_ffn_gate_up, w_ffn_down;
@@ -60,6 +62,7 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
         w_ffn_gate_up,
         w_ffn_down,
         stream,
+        comm_stream,
         comm,
         memory_pool,
     };
@@ -105,7 +108,9 @@ void releaseDeviceResource(DeviceResource &res) {
     infiniopDestroyHandle(res.handle);
     res.handle = nullptr;
     infinirtStreamDestroy(res.stream);
+    infinirtStreamDestroy(res.comm_stream);
     res.stream = nullptr;
+    res.comm_stream = nullptr;
     infinicclCommDestroy(res.comm);
     res.comm = nullptr;
 }
@@ -321,7 +326,14 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     void *workspace = workspace_storage->memory();
 
     // Compute
+    infinirtEvent_t prev_ffn_allreduce_done = nullptr; // carry across layers
     for (uint32_t layer = 0; layer < nlayer; layer++) {
+        // If previous layer issued FFN all-reduce, ensure it's done before using logits_in
+        if (rsrc.comm != nullptr && prev_ffn_allreduce_done != nullptr) {
+            RUN_INFINI(infinirtStreamWaitEvent(stream, prev_ffn_allreduce_done, 0));
+            RUN_INFINI(infinirtEventDestroy(prev_ffn_allreduce_done));
+            prev_ffn_allreduce_done = nullptr;
+        }
         // 1. Attention
         // rms norm
         RUN_INFINI(infiniopRMSNorm(
@@ -399,14 +411,23 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             rsrc.w_attn_out[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream)); // only rank 0 adds residual
 
         // All_reduce if distributed
+        infinirtEvent_t attn_allreduce_done = nullptr;
         if (rsrc.comm != nullptr) {
             RUN_INFINI(infinicclAllReduce(
                 logits_in->data(), logits_in->data(), ntok * d, dt_logits,
-                INFINICCL_SUM, rsrc.comm, stream));
-            RUN_INFINI(infinirtStreamSynchronize(stream));
+                INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
+            // Record completion event on comm stream
+            RUN_INFINI(infinirtEventCreate(&attn_allreduce_done));
+            RUN_INFINI(infinirtEventRecord(attn_allreduce_done, rsrc.comm_stream));
         }
         // 2. FFN
         // rms_norm
+        if (rsrc.comm != nullptr && attn_allreduce_done != nullptr) {
+            // Wait compute stream on comm completion before consuming logits_in
+            RUN_INFINI(infinirtStreamWaitEvent(stream, attn_allreduce_done, 0));
+            RUN_INFINI(infinirtEventDestroy(attn_allreduce_done));
+            attn_allreduce_done = nullptr;
+        }
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
@@ -427,9 +448,17 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         if (rsrc.comm != nullptr) {
             RUN_INFINI(infinicclAllReduce(
                 logits_in->data(), logits_in->data(), ntok * d, dt_logits,
-                INFINICCL_SUM, rsrc.comm, stream));
-            RUN_INFINI(infinirtStreamSynchronize(stream));
+                INFINICCL_SUM, rsrc.comm, rsrc.comm_stream));
+            // Defer synchronization to the start of next layer
+            RUN_INFINI(infinirtEventCreate(&prev_ffn_allreduce_done));
+            RUN_INFINI(infinirtEventRecord(prev_ffn_allreduce_done, rsrc.comm_stream));
         }
+    }
+    // Ensure last layer's FFN all-reduce completes before post-processing
+    if (rsrc.comm != nullptr && prev_ffn_allreduce_done != nullptr) {
+        RUN_INFINI(infinirtStreamWaitEvent(stream, prev_ffn_allreduce_done, 0));
+        RUN_INFINI(infinirtEventDestroy(prev_ffn_allreduce_done));
+        prev_ffn_allreduce_done = nullptr;
     }
     // Sample and Output
     if (idev == 0) {

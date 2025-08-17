@@ -23,7 +23,8 @@ struct DeviceResource {
     std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_out,
         w_ffn_norm, w_ffn_gate_up, w_ffn_down;
     // Streams
-    infinirtStream_t stream;
+    infinirtStream_t stream;       // compute stream
+    infinirtStream_t comm_stream;  // communication stream
     // Communicator
     infinicclComm_t comm;
 
