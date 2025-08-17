@@ -330,7 +330,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     for (uint32_t layer = 0; layer < nlayer; layer++) {
         // If previous layer issued FFN all-reduce, ensure it's done before using logits_in
         if (rsrc.comm != nullptr && prev_ffn_allreduce_done != nullptr) {
-            RUN_INFINI(infinirtStreamWaitEvent(stream, prev_ffn_allreduce_done, 0));
+            RUN_INFINI(infinirtStreamWaitEvent(stream, prev_ffn_allreduce_done));
             RUN_INFINI(infinirtEventDestroy(prev_ffn_allreduce_done));
             prev_ffn_allreduce_done = nullptr;
         }
@@ -424,7 +424,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         // rms_norm
         if (rsrc.comm != nullptr && attn_allreduce_done != nullptr) {
             // Wait compute stream on comm completion before consuming logits_in
-            RUN_INFINI(infinirtStreamWaitEvent(stream, attn_allreduce_done, 0));
+            RUN_INFINI(infinirtStreamWaitEvent(stream, attn_allreduce_done));
             RUN_INFINI(infinirtEventDestroy(attn_allreduce_done));
             attn_allreduce_done = nullptr;
         }
@@ -456,7 +456,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     }
     // Ensure last layer's FFN all-reduce completes before post-processing
     if (rsrc.comm != nullptr && prev_ffn_allreduce_done != nullptr) {
-        RUN_INFINI(infinirtStreamWaitEvent(stream, prev_ffn_allreduce_done, 0));
+        RUN_INFINI(infinirtStreamWaitEvent(stream, prev_ffn_allreduce_done));
         RUN_INFINI(infinirtEventDestroy(prev_ffn_allreduce_done));
         prev_ffn_allreduce_done = nullptr;
     }
