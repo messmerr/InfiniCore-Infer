@@ -394,6 +394,26 @@ class JiugeForCauslLM:
     def __init__(
         self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None
     ):
+        # 运行前设备可用性检查（仅对 NVIDIA 后端做明确校验）
+        if device == DeviceType.DEVICE_TYPE_NVIDIA:
+            try:
+                import torch as _torch
+                _available = _torch.cuda.device_count()
+            except Exception as _e:  # pragma: no cover
+                _available = 0
+            if ndev > _available:
+                import os as _os
+                raise RuntimeError(
+                    (
+                        "NVIDIA 后端可见 GPU 数量不足: 请求 ndev={ndev}, 可见={avail}. "
+                        "请检查分配的 GPU 数量与 CUDA_VISIBLE_DEVICES 环境变量.\n"
+                        "CUDA_VISIBLE_DEVICES={cvd}"
+                    ).format(
+                        ndev=ndev,
+                        avail=_available,
+                        cvd=_os.environ.get("CUDA_VISIBLE_DEVICES", "<未设置>")
+                    )
+                )
         def load_all_safetensors_from_dir(dir_path_: str):
             tensors_ = {}
             dir_path_ = Path(dir_path_)
