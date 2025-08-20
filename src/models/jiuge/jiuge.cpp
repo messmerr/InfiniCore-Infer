@@ -174,21 +174,26 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         meta.epsilon));
     RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm, &workspace_size));
     workspace_size = std::max(workspace_size, temp_size);
-    // Attention
-    infiniopGemmDescriptor_t desc_attn_qkv, desc_attn_o;
+    // Attention - RMSNorm+QKV fusion
+    infiniopGemmDescriptor_t desc_attn_o;
     infiniopRearrangeDescriptor_t desc_qkv_bias;
+    infiniopRMSNormGemmDescriptor_t desc_attn_rms_norm_gemm;
     if (has_qkv_bias) {
         RUN_INFINI(infiniopCreateRearrangeDescriptor(
             rsrc.handle, &desc_qkv_bias, qkv_buf->desc(),
             TensorDesc::create(dt_logits, {ntok, (nh + nkvh * 2) * dh}, {0, 1})->desc()));
     }
-    RUN_INFINI(infiniopCreateGemmDescriptor(
-        rsrc.handle, &desc_attn_qkv, qkv_buf->desc(),
-        logits_in->desc(), rsrc.w_attn_qkv[0]->desc()));
+    // Create RMSNorm+Gemm fusion descriptor for attention QKV
+    RUN_INFINI(infiniopCreateRMSNormGemmDescriptor(
+        rsrc.handle, &desc_attn_rms_norm_gemm, qkv_buf->desc(),
+        logits_in->desc(), rsrc.w_attn_qkv[0]->desc(),
+        rsrc.w_attn_norm[0]->desc(),
+        has_qkv_bias ? rsrc.b_attn_qkv[0]->desc() : nullptr,
+        meta.epsilon));
     RUN_INFINI(infiniopCreateGemmDescriptor(
         rsrc.handle, &desc_attn_o, logits_in->desc(),
         o_buf->desc(), rsrc.w_attn_out[0]->desc()));
-    RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_qkv, &temp_size));
+    RUN_INFINI(infiniopGetRMSNormGemmWorkspaceSize(desc_attn_rms_norm_gemm, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_o, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
@@ -274,13 +279,18 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     auto rearrange_q_buf = Tensor::buffer(dt_logits, {nkvh, ngroup * max_seq_len, dh}, rsrc.memory_pool);
     auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, dh}, rsrc.memory_pool);
 
-    // MLP descriptors
-    infiniopGemmDescriptor_t desc_ffn_gate_up, desc_ffn_down;
+    // MLP descriptors - RMSNorm+GateUp fusion
+    infiniopGemmDescriptor_t desc_ffn_down;
     infiniopSwiGLUDescriptor_t desc_swiglu;
-    RUN_INFINI(infiniopCreateGemmDescriptor(
-        rsrc.handle, &desc_ffn_gate_up, gate_up_buf->desc(),
-        logits_out->desc(), rsrc.w_ffn_gate_up[0]->desc()));
-    RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_ffn_gate_up, &temp_size));
+    infiniopRMSNormGemmDescriptor_t desc_ffn_rms_norm_gemm;
+    // Create RMSNorm+Gemm fusion descriptor for FFN GateUp
+    RUN_INFINI(infiniopCreateRMSNormGemmDescriptor(
+        rsrc.handle, &desc_ffn_rms_norm_gemm, gate_up_buf->desc(),
+        logits_in->desc(), rsrc.w_ffn_gate_up[0]->desc(),
+        rsrc.w_ffn_norm[0]->desc(),
+        nullptr, // FFN typically doesn't have bias
+        meta.epsilon));
+    RUN_INFINI(infiniopGetRMSNormGemmWorkspaceSize(desc_ffn_rms_norm_gemm, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
     auto gate_buf = gate_up_buf->slice(1, 0, di);
     auto up_buf = gate_up_buf->slice(1, di, di);
@@ -322,22 +332,14 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
     // Compute
     for (uint32_t layer = 0; layer < nlayer; layer++) {
-        // 1. Attention
-        // rms norm
-        RUN_INFINI(infiniopRMSNorm(
-            desc_norm, workspace, workspace_size,
-            logits_out->data(), logits_in->data(),
-            rsrc.w_attn_norm[layer]->data(), stream));
-        // qkv_proj
-        if (has_qkv_bias) {
-            RUN_INFINI(infiniopRearrange(
-                desc_qkv_bias,
-                qkv_buf->data(), rsrc.b_attn_qkv[layer]->data(), stream));
-        }
-        RUN_INFINI(infiniopGemm(
-            desc_attn_qkv, workspace, workspace_size,
-            qkv_buf->data(), logits_out->data(),
-            rsrc.w_attn_qkv[layer]->data(), 1.0, has_qkv_bias ? 1.0 : 0.0, stream));
+        // 1. Attention - Use RMSNorm+QKV fusion
+        RUN_INFINI(infiniopRMSNormGemm(
+            desc_attn_rms_norm_gemm, workspace, workspace_size,
+            qkv_buf->data(), logits_in->data(),
+            rsrc.w_attn_qkv[layer]->data(),
+            rsrc.w_attn_norm[layer]->data(),
+            has_qkv_bias ? rsrc.b_attn_qkv[layer]->data() : nullptr,
+            stream));
         // rope
         RUN_INFINI(infiniopRoPE(
             desc_rope_q, workspace, workspace_size,
@@ -405,16 +407,14 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
-        // 2. FFN
-        // rms_norm
-        RUN_INFINI(infiniopRMSNorm(
-            desc_norm, workspace, workspace_size,
-            logits_out->data(), logits_in->data(),
-            rsrc.w_ffn_norm[layer]->data(), stream));
-        RUN_INFINI(infiniopGemm(
-            desc_ffn_gate_up, workspace, workspace_size,
-            gate_up_buf->data(), logits_out->data(), rsrc.w_ffn_gate_up[layer]->data(),
-            1.0, 0.0, stream));
+        // 2. FFN - Use RMSNorm+GateUp fusion
+        RUN_INFINI(infiniopRMSNormGemm(
+            desc_ffn_rms_norm_gemm, workspace, workspace_size,
+            gate_up_buf->data(), logits_in->data(),
+            rsrc.w_ffn_gate_up[layer]->data(),
+            rsrc.w_ffn_norm[layer]->data(),
+            nullptr, // No bias for FFN
+            stream));
         RUN_INFINI(infiniopSwiGLU(
             desc_swiglu, workspace, workspace_size,
             gate_buf->data(), up_buf->data(), gate_buf->data(), stream));
@@ -477,7 +477,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     if (has_qkv_bias) {
         infiniopDestroyRearrangeDescriptor(desc_qkv_bias);
     }
-    infiniopDestroyGemmDescriptor(desc_attn_qkv);
+    infiniopDestroyRMSNormGemmDescriptor(desc_attn_rms_norm_gemm);
     infiniopDestroyGemmDescriptor(desc_attn_o);
     infiniopDestroyRoPEDescriptor(desc_rope_q);
     infiniopDestroyRoPEDescriptor(desc_rope_k);
@@ -489,7 +489,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         infiniopDestroyGemmDescriptor(desc_attn_v_gemms[req]);
         infiniopDestroyRearrangeDescriptor(desc_attn_v_rearranges[req]);
     }
-    infiniopDestroyGemmDescriptor(desc_ffn_gate_up);
+    infiniopDestroyRMSNormGemmDescriptor(desc_ffn_rms_norm_gemm);
     infiniopDestroySwiGLUDescriptor(desc_swiglu);
     infiniopDestroyGemmDescriptor(desc_ffn_down);
     infiniopDestroyRMSNormDescriptor(desc_norm_out);
